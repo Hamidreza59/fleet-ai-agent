@@ -1,7 +1,7 @@
 # fleet-ai-agent
 
 An **AI fleet-manager agent** in TypeScript. It connects to the
-[`fleet-mcp-server`](../fleet-mcp-server) as an **MCP client**, gives those tools
+[`fleet-mcp-server`](https://github.com/Hamidreza59/fleet-mcp-server) as an **MCP client**, gives those tools
 to an LLM (**AWS Bedrock Converse** by default), and runs an agentic tool-use
 loop to answer operational questions about a vehicle fleet.
 
