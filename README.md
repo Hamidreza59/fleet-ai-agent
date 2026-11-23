@@ -5,8 +5,8 @@ An **AI fleet-manager agent** in TypeScript. It connects to the
 to an LLM (**AWS Bedrock Converse** by default), and runs an agentic tool-use
 loop to answer operational questions about a vehicle fleet.
 
-> Sanitized, clean-room reference architecture with synthetic data — no
-> proprietary code. This is the agent half of a two-part demo.
+> Built from scratch as a reference architecture, using synthetic data.
+> This is the agent half of a two-part demo.
 
 ## What it does
 
@@ -24,6 +24,8 @@ Behind that single request the agent:
 4. Returns a prioritized, structured recommendation — plus a trace of which tools it called.
 
 ## Architecture
+
+![Architecture diagram](docs/architecture.png)
 
 ```
   HTTP ──► Express ──► FleetAgent (tool-use loop)
