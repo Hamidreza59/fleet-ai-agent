@@ -12,6 +12,8 @@ export interface ToolSpec {
   name: string;
   description: string;
   inputSchema: JsonSchema;
+  /** True when the tool mutates external state. */
+  sideEffect?: boolean;
 }
 
 /** A tool invocation requested by the model. */
@@ -27,15 +29,22 @@ export type ChatMessage =
   | { role: "assistant"; text?: string; toolCalls?: ToolCall[] }
   | { role: "tool"; toolCallId: string; toolName: string; result: string };
 
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
 /** One model turn: free text and/or a set of tool calls to run. */
 export interface LlmResponse {
   text?: string;
   toolCalls: ToolCall[];
+  usage?: Usage;
 }
 
 /** The seam every LLM backend implements (Bedrock, OpenAI-compatible, mock). */
 export interface LlmProvider {
   readonly name: string;
+  readonly model: string;
   converse(system: string, messages: ChatMessage[], tools: ToolSpec[]): Promise<LlmResponse>;
 }
 

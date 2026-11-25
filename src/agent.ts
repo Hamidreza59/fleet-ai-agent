@@ -9,8 +9,27 @@
  * exact model (Bedrock/Groq/mock) and tool source (MCP/local) are swappable.
  */
 
+import { createHash, randomUUID } from "node:crypto";
+import { ApprovalQueue } from "./guardrails/approvals.js";
+import { budgetExceeded, estimateCostUsd, type RunBudget } from "./guardrails/budget.js";
+import {
+  defaultGuards,
+  isUsableObservation,
+  type GuardContext,
+  type GuardDecision,
+  type ToolGuard,
+  type WritePolicy,
+} from "./guardrails/guards.js";
 import type { ChatMemory } from "./memory/chatMemory.js";
-import type { ChatMessage, LlmProvider, ToolBox, ToolCall } from "./types.js";
+import {
+  NullTrajectorySink,
+  type LlmStep,
+  type StopReason,
+  type ToolStep,
+  type Trajectory,
+  type TrajectorySink,
+} from "./trace/trajectory.js";
+import type { ChatMessage, LlmProvider, ToolBox, ToolCall, Usage } from "./types.js";
 
 export const SYSTEM_PROMPT = `You are an AI Fleet Manager responsible for monitoring, diagnosing, and managing the health and efficiency of a vehicle fleet.
 
@@ -19,7 +38,7 @@ Your responsibilities:
 - Interpret DTC (OBD-II) codes, explain what they mean, and recommend next service actions.
 - Flag vehicles below safe fuel/charge thresholds and degraded battery health.
 - When you need to explain a DTC or cite a maintenance threshold, call search_maintenance_knowledge first — do not guess.
-- When a vehicle needs service, call schedule_maintenance_appointment.
+- Only call schedule_maintenance_appointment when the user explicitly asks you to book or schedule service. Otherwise recommend the service in your answer and let the user decide.
 
 Your behavior:
 - Always call tools to get real data; never invent VINs, codes, or readings.
@@ -27,71 +46,212 @@ Your behavior:
 - Give actionable recommendations, not just raw data.
 - If a tool returns an error, say so plainly and suggest what the user should check.`;
 
+export const SYSTEM_PROMPT_SHA256 = createHash("sha256").update(SYSTEM_PROMPT).digest("hex");
+
+export const BUDGET_EXCEEDED_ANSWER = "Stopped: this request exceeded its token/cost budget.";
+const MAX_ITERATIONS_ANSWER =
+  "I reached the tool-call limit before finishing. Please narrow the question and try again.";
+
+export interface AgentOptions {
+  maxIterations?: number;
+  guards?: ToolGuard[];
+  writePolicy?: WritePolicy;
+  budget?: RunBudget;
+  approvals?: ApprovalQueue;
+  sink?: TrajectorySink;
+  metadata?: Record<string, string>;
+}
+
 export interface AgentResult {
+  runId: string;
   answer: string;
   toolCalls: { name: string; input: Record<string, unknown> }[];
   iterations: number;
+  stopReason: StopReason;
+  usage: Usage;
+  costUsd: number;
+  pendingApprovals: string[];
+  trajectory: Trajectory;
 }
 
 export class FleetAgent {
+  readonly approvals: ApprovalQueue;
+  private maxIterations: number;
+  private guards: ToolGuard[];
+  private budget: RunBudget;
+  private sink: TrajectorySink;
+  private metadata: Record<string, string>;
+  private writePolicy?: WritePolicy;
+
   constructor(
     private llm: LlmProvider,
     private tools: ToolBox,
     private memory: ChatMemory,
-    private maxIterations = 6,
-  ) {}
+    opts: AgentOptions = {},
+  ) {
+    this.maxIterations = opts.maxIterations ?? 6;
+    this.writePolicy = opts.writePolicy ?? (opts.guards ? undefined : "approval");
+    this.guards = opts.guards ?? defaultGuards(this.writePolicy);
+    this.budget = opts.budget ?? {};
+    this.approvals = opts.approvals ?? new ApprovalQueue();
+    this.sink = opts.sink ?? new NullTrajectorySink();
+    this.metadata = opts.metadata ?? {};
+  }
 
-  async inquire(managerId: string, question: string): Promise<AgentResult> {
+  async inquire(
+    managerId: string,
+    question: string,
+    runMetadata: Record<string, string> = {},
+  ): Promise<AgentResult> {
+    const runId = randomUUID();
+    const startedAt = new Date();
+    const t0 = performance.now();
     const toolSpecs = this.tools.specs();
-    const history = this.memory.history(managerId);
+    const history = [...this.memory.history(managerId)];
     const turn: ChatMessage[] = [{ role: "user", text: question }];
     const executed: AgentResult["toolCalls"] = [];
+    const steps: Trajectory["steps"] = [];
+    const pendingApprovals: string[] = [];
+    const observations = history.flatMap((m) =>
+      m.role === "tool" && isUsableObservation(m.result) ? [m.result] : [],
+    );
+    const userTexts = history.flatMap((m) => (m.role === "user" ? [m.text] : []));
+    const usage: Usage = { inputTokens: 0, outputTokens: 0 };
+    let costUsd = 0;
+    let answer = MAX_ITERATIONS_ANSWER;
+    let stopReason: StopReason = "max_iterations";
 
     let iterations = 0;
     while (iterations < this.maxIterations) {
       iterations++;
+      const llmStart = performance.now();
       const response = await this.llm.converse(SYSTEM_PROMPT, [...history, ...turn], toolSpecs);
-
-      // Record the assistant turn (text and/or tool calls).
-      turn.push({
-        role: "assistant",
+      const llmStep: LlmStep = {
+        type: "llm",
+        iteration: iterations,
+        latencyMs: performance.now() - llmStart,
+        usage: response.usage,
         text: response.text,
-        toolCalls: response.toolCalls.length ? response.toolCalls : undefined,
-      });
-
-      if (response.toolCalls.length === 0) {
-        // Final answer — persist the exchange and return.
-        this.memory.append(managerId, turn);
-        return { answer: response.text ?? "", toolCalls: executed, iterations };
+        toolCalls: response.toolCalls,
+      };
+      steps.push(llmStep);
+      if (response.usage) {
+        usage.inputTokens += response.usage.inputTokens;
+        usage.outputTokens += response.usage.outputTokens;
+        costUsd = estimateCostUsd(this.llm.model, usage);
       }
 
-      // Execute every requested tool call and append results.
+      if (response.toolCalls.length === 0) {
+        turn.push({ role: "assistant", text: response.text });
+        answer = response.text ?? "";
+        stopReason = "final_answer";
+        break;
+      }
+
+      if (budgetExceeded(this.budget, usage, costUsd)) {
+        for (const call of response.toolCalls) executed.push({ name: call.name, input: call.input });
+        turn.push({ role: "assistant", text: BUDGET_EXCEEDED_ANSWER });
+        answer = BUDGET_EXCEEDED_ANSWER;
+        stopReason = "budget_exceeded";
+        break;
+      }
+
+      turn.push({ role: "assistant", text: response.text, toolCalls: response.toolCalls });
+
       for (const call of response.toolCalls) {
         executed.push({ name: call.name, input: call.input });
-        const result = await this.runTool(call);
-        turn.push({
-          role: "tool",
-          toolCallId: call.id,
-          toolName: call.name,
-          result,
+        const step = await this.runTool(call, iterations, {
+          runId,
+          managerId,
+          question,
+          observations,
+          userTexts,
         });
+        steps.push(step);
+        if (step.approvalId) pendingApprovals.push(step.approvalId);
+        if (step.status === "ok" && isUsableObservation(step.output)) observations.push(step.output);
+        turn.push({ role: "tool", toolCallId: call.id, toolName: call.name, result: step.output });
       }
     }
 
     this.memory.append(managerId, turn);
-    return {
-      answer:
-        "I reached the tool-call limit before finishing. Please narrow the question and try again.",
-      toolCalls: executed,
-      iterations,
+    const finishedAt = new Date();
+    const trajectory: Trajectory = {
+      schemaVersion: 1,
+      runId,
+      managerId,
+      question,
+      history,
+      provider: this.llm.name,
+      model: this.llm.model,
+      systemPromptSha256: SYSTEM_PROMPT_SHA256,
+      tools: toolSpecs,
+      startedAt: startedAt.toISOString(),
+      finishedAt: finishedAt.toISOString(),
+      latencyMs: performance.now() - t0,
+      steps,
+      answer,
+      stopReason,
+      usage,
+      costUsd,
+      pendingApprovals,
+      metadata: {
+        ...this.metadata,
+        ...runMetadata,
+        ...(this.writePolicy ? { writePolicy: this.writePolicy } : {}),
+        maxIterations: String(this.maxIterations),
+      },
     };
+    try {
+      await this.sink.write(trajectory);
+    } catch (err) {
+      console.error("[trajectory] write failed:", (err as Error).message);
+    }
+
+    return { runId, answer, toolCalls: executed, iterations, stopReason, usage, costUsd, pendingApprovals, trajectory };
   }
 
-  private async runTool(call: ToolCall): Promise<string> {
+  private async runTool(
+    call: ToolCall,
+    iteration: number,
+    base: Omit<GuardContext, "spec">,
+  ): Promise<ToolStep> {
+    const start = performance.now();
+    const step = (s: Pick<ToolStep, "output" | "status" | "guardrail" | "approvalId">): ToolStep => ({
+      type: "tool",
+      iteration,
+      callId: call.id,
+      name: call.name,
+      input: call.input,
+      latencyMs: performance.now() - start,
+      ...s,
+    });
+
+    const spec = this.tools.specs().find((t) => t.name === call.name);
+    for (const guard of this.guards) {
+      const decision: GuardDecision = guard.check(call, { ...base, spec });
+      if (decision.action === "deny") {
+        return step({
+          output: `BLOCKED by guardrail ${guard.name}: ${decision.reason}. The tool was not executed.`,
+          status: "blocked",
+          guardrail: guard.name,
+        });
+      }
+      if (decision.action === "require_approval") {
+        const pending = this.approvals.create({ runId: base.runId, managerId: base.managerId, call });
+        return step({
+          output: `PENDING_APPROVAL: ${call.name} requires human approval (approval id ${pending.id}). It has NOT been executed. Tell the user it is awaiting approval. Still answer the rest of the user's question.`,
+          status: "pending_approval",
+          guardrail: guard.name,
+          approvalId: pending.id,
+        });
+      }
+    }
+
     try {
-      return await this.tools.execute(call.name, call.input);
+      return step({ output: await this.tools.execute(call.name, call.input), status: "ok" });
     } catch (err) {
-      return `ERROR calling ${call.name}: ${(err as Error).message}`;
+      return step({ output: `ERROR calling ${call.name}: ${(err as Error).message}`, status: "error" });
     }
   }
 }

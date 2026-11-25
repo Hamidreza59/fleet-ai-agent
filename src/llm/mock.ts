@@ -9,8 +9,19 @@ import type { ChatMessage, LlmProvider, LlmResponse, ToolSpec } from "../types.j
 
 export class MockLlmProvider implements LlmProvider {
   readonly name = "mock";
+  readonly model = "mock";
 
-  async converse(_system: string, messages: ChatMessage[], tools: ToolSpec[]): Promise<LlmResponse> {
+  async converse(system: string, messages: ChatMessage[], tools: ToolSpec[]): Promise<LlmResponse> {
+    const res = this.respond(messages, tools);
+    const inChars = system.length + JSON.stringify(messages).length;
+    const outChars = (res.text ?? "").length + JSON.stringify(res.toolCalls).length;
+    return {
+      ...res,
+      usage: { inputTokens: Math.ceil(inChars / 4), outputTokens: Math.ceil(outChars / 4) },
+    };
+  }
+
+  private respond(messages: ChatMessage[], tools: ToolSpec[]): LlmResponse {
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     const userText = lastUser && "text" in lastUser ? lastUser.text.toLowerCase() : "";
     const alreadyCalled = messages.some((m) => m.role === "tool");

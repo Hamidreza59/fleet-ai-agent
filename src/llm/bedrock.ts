@@ -16,7 +16,7 @@ export class BedrockLlmProvider implements LlmProvider {
   private client: BedrockRuntimeClient;
 
   constructor(
-    private modelId: string,
+    readonly model: string,
     region: string,
   ) {
     this.client = new BedrockRuntimeClient({ region });
@@ -24,7 +24,7 @@ export class BedrockLlmProvider implements LlmProvider {
 
   async converse(system: string, messages: ChatMessage[], tools: ToolSpec[]): Promise<LlmResponse> {
     const command = new ConverseCommand({
-      modelId: this.modelId,
+      modelId: this.model,
       system: [{ text: system }],
       messages: messages.map(toBedrockMessage),
       toolConfig: tools.length ? { tools: tools.map(toBedrockTool) } : undefined,
@@ -46,7 +46,10 @@ export class BedrockLlmProvider implements LlmProvider {
         });
       }
     }
-    return { text: text || undefined, toolCalls };
+    const usage = res.usage
+      ? { inputTokens: res.usage.inputTokens ?? 0, outputTokens: res.usage.outputTokens ?? 0 }
+      : undefined;
+    return { text: text || undefined, toolCalls, usage };
   }
 }
 

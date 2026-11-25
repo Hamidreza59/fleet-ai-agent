@@ -7,6 +7,10 @@ import { McpToolBox } from "./mcp/client.js";
 import { ChatMemory } from "./memory/chatMemory.js";
 import { CompositeToolBox, LocalToolBox } from "./tools/registry.js";
 import { FleetAgent } from "./agent.js";
+import { ApprovalQueue, type PendingApproval } from "./guardrails/approvals.js";
+import { JsonlTrajectorySink, NullTrajectorySink } from "./trace/trajectory.js";
+
+const APPROVAL_STATUSES = ["pending", "executing", "approved", "rejected", "failed"];
 
 async function main() {
   const config = loadConfig();
@@ -19,7 +23,14 @@ async function main() {
   const tools = new CompositeToolBox([mcpTools, new LocalToolBox()]);
   const llm = createLlmProvider(config);
   const memory = new ChatMemory();
-  const agent = new FleetAgent(llm, tools, memory, config.maxToolIterations);
+  const approvals = new ApprovalQueue();
+  const agent = new FleetAgent(llm, tools, memory, {
+    maxIterations: config.maxToolIterations,
+    writePolicy: config.writeToolPolicy,
+    budget: { maxTokens: config.maxTokensPerRun, maxCostUsd: config.maxCostUsdPerRun },
+    approvals,
+    sink: config.trajectoryFile ? new JsonlTrajectorySink(config.trajectoryFile) : new NullTrajectorySink(),
+  });
 
   const app = express();
   app.use(express.json());
@@ -39,7 +50,8 @@ async function main() {
     }
     try {
       const result = await agent.inquire(manager, query);
-      res.json(result);
+      const { trajectory: _trajectory, ...body } = result;
+      res.json(body);
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: (err as Error).message });
@@ -48,6 +60,31 @@ async function main() {
 
   app.get("/fleet/:manager/inquire", handle);
   app.post("/fleet/:manager/inquire", handle);
+
+  app.get("/approvals", (req, res) => {
+    const status = req.query.status as string | undefined;
+    if (status !== undefined && !APPROVAL_STATUSES.includes(status as PendingApproval["status"])) {
+      res.status(400).json({ error: `status must be one of: ${APPROVAL_STATUSES.join(", ")}` });
+      return;
+    }
+    res.json(approvals.list(status as PendingApproval["status"] | undefined));
+  });
+
+  const resolve = (action: "approve" | "reject") => async (req: express.Request, res: express.Response) => {
+    const id = req.params.id;
+    const item = approvals.get(id);
+    if (!item) {
+      res.status(404).json({ error: `Unknown approval ${id}` });
+      return;
+    }
+    if (item.status !== "pending") {
+      res.status(409).json({ error: `Approval ${id} is already ${item.status}` });
+      return;
+    }
+    res.json(action === "approve" ? await approvals.approve(id, tools) : approvals.reject(id));
+  };
+  app.post("/approvals/:id/approve", resolve("approve"));
+  app.post("/approvals/:id/reject", resolve("reject"));
 
   app.listen(config.port, () => {
     console.log(`[ready] fleet-ai-agent listening on http://localhost:${config.port}`);
