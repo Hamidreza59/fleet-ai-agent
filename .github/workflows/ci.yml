@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  test:
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run eval:replay
+
+  live-eval:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Hamidreza59/fleet-mcp-server
+          path: fleet-mcp-server
+      - uses: astral-sh/setup-uv@v5
+      # no uv.lock in the server repo, so this resolves unpinned dependencies
+      - run: uv sync
+        working-directory: fleet-mcp-server
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Skip notice
+        if: env.OPENAI_API_KEY == ''
+        run: echo "::notice::OPENAI_API_KEY secret not set; skipping live eval"
+      - name: Live eval
+        if: env.OPENAI_API_KEY != ''
+        env:
+          LLM_PROVIDER: openai-compatible
+          OPENAI_BASE_URL: https://api.groq.com/openai/v1
+          OPENAI_MODEL: llama-3.3-70b-versatile
+          MCP_COMMAND: uv
+          MCP_ARGS: --directory fleet-mcp-server run fleet-mcp-server
+        run: npm run eval -- --judge --tags smoke --min-pass-rate 0.5 --baseline evals/baselines/llama-3.3-70b-versatile.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-reports
+          path: evals/reports
+          if-no-files-found: ignore

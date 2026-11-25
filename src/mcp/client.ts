@@ -11,6 +11,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { isErrorPayload } from "../guardrails/guards.js";
 import type { McpConfig } from "../config.js";
 import type { JsonSchema, ToolBox, ToolSpec } from "../types.js";
 
@@ -55,10 +56,14 @@ export class McpToolBox implements ToolBox {
   async execute(name: string, input: Record<string, unknown>): Promise<string> {
     const result = await this.client.callTool({ name, arguments: input });
     const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
-    return content
+    const text = content
       .filter((c) => c.type === "text")
       .map((c) => c.text ?? "")
       .join("\n");
+    if (result.isError) throw new Error(text || "tool reported an error");
+    if (!text) return "[]";
+    if (isErrorPayload(text)) throw new Error(errorMessage(text));
+    return text;
   }
 
   async close(): Promise<void> {
@@ -74,4 +79,10 @@ function normalizeSchema(schema: unknown): JsonSchema {
     properties: (s.properties as Record<string, unknown>) ?? {},
     required: (s.required as string[]) ?? [],
   };
+}
+
+function errorMessage(text: string): string {
+  const v = JSON.parse(text) as unknown;
+  const first = (Array.isArray(v) ? v[0] : v) as { error: unknown };
+  return String(first.error);
 }

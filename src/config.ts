@@ -4,6 +4,10 @@ export interface Config {
   port: number;
   llmProvider: "bedrock" | "openai-compatible" | "mock";
   maxToolIterations: number;
+  trajectoryFile: string;
+  writeToolPolicy: "allow" | "approval" | "deny";
+  maxTokensPerRun: number;
+  maxCostUsdPerRun: number;
 
   // Bedrock
   awsRegion: string;
@@ -33,11 +37,25 @@ function mcpConfig(): McpConfig {
   return { transport: "stdio", command, args };
 }
 
+function envNumber(name: string, def: number): number {
+  const v = process.env[name]?.trim();
+  const n = v ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : def;
+}
+
+function writePolicy(v: string | undefined): Config["writeToolPolicy"] {
+  return v === "allow" || v === "deny" ? v : "approval";
+}
+
 export function loadConfig(): Config {
   return {
     port: Number(process.env.PORT ?? 3000),
     llmProvider: (process.env.LLM_PROVIDER ?? "bedrock") as Config["llmProvider"],
-    maxToolIterations: Number(process.env.MAX_TOOL_ITERATIONS ?? 6),
+    maxToolIterations: envNumber("MAX_TOOL_ITERATIONS", 6),
+    trajectoryFile: process.env.TRAJECTORY_FILE ?? "runs/trajectories.jsonl",
+    writeToolPolicy: writePolicy(process.env.WRITE_TOOL_POLICY),
+    maxTokensPerRun: envNumber("MAX_TOKENS_PER_RUN", 50000),
+    maxCostUsdPerRun: envNumber("MAX_COST_USD_PER_RUN", 0.05),
 
     awsRegion: process.env.AWS_REGION ?? "us-east-1",
     bedrockModelId: process.env.BEDROCK_MODEL_ID ?? "amazon.nova-lite-v1:0",

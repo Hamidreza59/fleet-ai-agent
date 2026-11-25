@@ -12,7 +12,10 @@
     "build": "tsc -p tsconfig.json",
     "serve": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "eval": "tsx src/cli/eval.ts",
+    "eval:replay": "tsx src/cli/eval.ts --replay evals/golden/trajectories.jsonl --min-pass-rate 1",
+    "replay": "tsx src/cli/replay.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.658.0",

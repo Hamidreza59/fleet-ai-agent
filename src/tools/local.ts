@@ -15,6 +15,7 @@ export interface LocalTool {
 export const scheduleMaintenanceTool: LocalTool = {
   spec: {
     name: "schedule_maintenance_appointment",
+    sideEffect: true,
     description:
       "Schedule a maintenance appointment for a vehicle. Use after identifying an " +
       "issue (DTC, low fuel/charge, degraded battery) that requires service.",

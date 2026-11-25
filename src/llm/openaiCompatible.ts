@@ -22,7 +22,8 @@ export class OpenAICompatibleLlmProvider implements LlmProvider {
   constructor(
     private baseUrl: string,
     private apiKey: string,
-    private model: string,
+    readonly model: string,
+    private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
   ) {}
 
   async converse(system: string, messages: ChatMessage[], tools: ToolSpec[]): Promise<LlmResponse> {
@@ -34,14 +35,7 @@ export class OpenAICompatibleLlmProvider implements LlmProvider {
       tool_choice: tools.length ? "auto" : undefined,
     };
 
-    const res = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
-      },
-      body: JSON.stringify(body),
-    });
+    const res = await this.post(JSON.stringify(body));
 
     if (!res.ok) {
       throw new Error(`LLM request failed (${res.status}): ${await res.text()}`);
@@ -49,6 +43,7 @@ export class OpenAICompatibleLlmProvider implements LlmProvider {
 
     const data = (await res.json()) as {
       choices: { message: { content: string | null; tool_calls?: OpenAIToolCall[] } }[];
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     const message = data.choices[0]?.message;
     const toolCalls: ToolCall[] = (message?.tool_calls ?? []).map((tc) => ({
@@ -57,8 +52,36 @@ export class OpenAICompatibleLlmProvider implements LlmProvider {
       input: safeParse(tc.function.arguments),
     }));
 
-    return { text: message?.content ?? undefined, toolCalls };
+    const usage = data.usage
+      ? { inputTokens: data.usage.prompt_tokens ?? 0, outputTokens: data.usage.completion_tokens ?? 0 }
+      : undefined;
+    return { text: message?.content ?? undefined, toolCalls, usage };
   }
+
+  private async post(body: string): Promise<Response> {
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+        },
+        body,
+      });
+      const retryable = res.status === 429 || res.status >= 500;
+      if (!retryable || attempt >= MAX_RETRIES) return res;
+      await res.body?.cancel();
+      await this.sleep(retryDelayMs(res, attempt));
+    }
+  }
+}
+
+const MAX_RETRIES = 3;
+const MAX_DELAY_MS = 30_000;
+
+function retryDelayMs(res: Response, attempt: number): number {
+  const secs = Number(res.headers.get("retry-after"));
+  return Math.min(MAX_DELAY_MS, Number.isFinite(secs) && secs > 0 ? secs * 1000 : 2000 * 2 ** attempt);
 }
 
 function toOpenAITool(spec: ToolSpec) {
